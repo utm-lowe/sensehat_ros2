@@ -18,8 +18,7 @@ class SenseHatNode(Node):
         self.pressure_pub = self.create_publisher(FluidPressure, 'sensehat/pressure', 10)
         self.imu_pub = self.create_publisher(Imu, 'sensehat/imu', 10)
         self.mag_pub = self.create_publisher(MagneticField, 'sensehat/magnetometer', 10)
-        self.color_pub = self.create_publisher(ColorRGBA, 'sensehat/color', 10)
-        self.brightness_pub = self.create_publisher(Float32, 'sensehat/brightness', 10)
+
         # Subscriber to LED messages (string for simplicity)
         self.led_sub = self.create_subscription(String, 'sensehat/led_display', self.led_callback, 10)
 
@@ -70,20 +69,6 @@ class SenseHatNode(Node):
         mag_msg.magnetic_field.y = mag['y']
         mag_msg.magnetic_field.z = mag['z']
         self.mag_pub.publish(mag_msg)
-
-        # Color (RGB) from Sense HAT
-        color_msg = ColorRGBA()
-        r, g, b = self.sense.get_pixel(0, 0)  # example: read pixel at (0,0)
-        color_msg.r = r / 255.0
-        color_msg.g = g / 255.0
-        color_msg.b = b / 255.0
-        color_msg.a = 1.0
-        self.color_pub.publish(color_msg)
-
-        # Brightness (0-1)
-        brightness_msg = Float32()
-        brightness_msg.data = self.sense.get_pixel_brightness() if hasattr(self.sense, 'get_pixel_brightness') else 1.0
-        self.brightness_pub.publish(brightness_msg)
 
         self.get_logger().debug('Published real sensor data')
 
