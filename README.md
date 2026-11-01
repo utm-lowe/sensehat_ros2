@@ -1,7 +1,7 @@
 # sensehat_ros2
 
-ROS 2 interfaces for the Raspberry Pi Sense HAT v2: sensor publishers plus an
-8x8 LED matrix controlled by a single `LedCommand` message.
+ROS 2 interfaces for the Raspberry Pi Sense HAT v2: sensor publishers, 8x8 LED
+matrix control via a single `LedCommand` message, and 5-way joystick events.
 
 ## Build
 
@@ -79,6 +79,71 @@ Run them from the package source directory after sourcing the workspace.
 `MESSAGE` command with default colours. Disable it with
 `-p legacy_string_topic:=false`.
 
+## Stick interface
+
+The 5-way joystick is published as discrete events on `sensehat/stick`
+(`sensehat_ros2/msg/StickEvent`), one message per hardware event, in order.
+
+| `direction` | Constant |
+| ----------- | -------- |
+| `0`         | `UP`     |
+| `1`         | `DOWN`   |
+| `2`         | `LEFT`   |
+| `3`         | `RIGHT`  |
+| `4`         | `MIDDLE` |
+
+| `action` | Constant   | Meaning                        |
+| -------- | ---------- | ------------------------------ |
+| `0`      | `PRESSED`  | Stick pushed down              |
+| `1`      | `RELEASED` | Stick let go                   |
+| `2`      | `HELD`     | Still down (kernel autorepeat) |
+
+`HELD` is kernel autorepeat while a direction stays down, so it is **not**
+published unless `publish_held_events:=true`.
+
+```bash
+ros2 topic echo /sensehat/stick
+ros2 run sensehat_ros2 sensehat_node -p publish_held_events:=true
+```
+
+In a subscriber, compare against the message constants:
+
+```python
+from sensehat_ros2.msg import StickEvent
+
+def stick_callback(self, msg):
+    if msg.direction == StickEvent.MIDDLE and msg.action == StickEvent.PRESSED:
+        self.toggle_mode()
+```
+
+The node polls `SenseStick.get_events()` on a timer (`stick_poll_frequency`),
+so do **not** also assign `sense.stick.direction_*` callbacks: both paths
+consume the same evdev device and would steal events from each other.
+
+### Level state for generic consumers
+
+For nodes that expect a level signal rather than edges (teleop, rviz, joystick
+demos), `sensehat/joy` (`sensor_msgs/Joy`) mirrors the buttons:
+
+| `buttons` index | Direction |
+| --------------- | --------- |
+| `0`             | up        |
+| `1`             | down      |
+| `2`             | left      |
+| `3`             | right     |
+| `4`             | middle    |
+
+Each entry is `1` while pressed and `0` otherwise. It is published when the
+state changes and republished at `publish_frequency` so late-joining
+subscribers still learn the current state. `axes` is left empty. Disable it
+with `-p publish_joy:=false`.
+
+### Example script
+
+`examples/stick_listener.py` prints every event (`UP pressed`,
+`MIDDLE released`, ...). Run it from the package source directory after
+sourcing the workspace.
+
 ## Parameters
 
 | Parameter                 | Default         | Meaning                                   |
@@ -90,8 +155,17 @@ Run them from the package source directory after sourcing the workspace.
 | `rotation`                | `0`             | `0`, `90`, `180` or `270`                 |
 | `led_queue_size`          | `8`             | Pending LED commands before drop-oldest   |
 | `legacy_string_topic`     | `true`          | Enable the `std_msgs/String` LED topic    |
+| `publish_stick_events`    | `true`          | Publish `sensehat/stick` events           |
+| `publish_held_events`     | `false`         | Include autorepeat `HELD` events          |
+| `publish_joy`             | `true`          | Publish the `sensor_msgs/Joy` mirror      |
+| `stick_poll_frequency`    | `50.0`          | Joystick polling rate (Hz)                |
 
-## Sensor topics
+## Topics
 
-`sensehat/temperature`, `sensehat/humidity`, `sensehat/pressure`,
+Sensors: `sensehat/temperature`, `sensehat/humidity`, `sensehat/pressure`,
 `sensehat/imu`, `sensehat/magnetometer`.
+
+Stick: `sensehat/stick` (`StickEvent`) and `sensehat/joy` (`sensor_msgs/Joy`).
+
+LED input: `sensehat/led` (`LedCommand`) and the legacy
+`sensehat/led_display` (`std_msgs/String`).

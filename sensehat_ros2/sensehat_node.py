@@ -6,14 +6,33 @@ import threading
 import rclpy
 from rclpy.node import Node
 from sense_hat import SenseHat
-from sensor_msgs.msg import FluidPressure, Imu, MagneticField, Temperature
+from sensor_msgs.msg import FluidPressure, Imu, Joy, MagneticField, Temperature
 from std_msgs.msg import Float32, String
 
-from sensehat_ros2.msg import LedCommand
+from sensehat_ros2.msg import LedCommand, StickEvent
 
 LED_TOPIC = 'sensehat/led'
 LEGACY_LED_TOPIC = 'sensehat/led_display'
+STICK_TOPIC = 'sensehat/stick'
+JOY_TOPIC = 'sensehat/joy'
 VALID_ROTATIONS = (0, 90, 180, 270)
+
+# sense_hat InputEvent strings -> StickEvent constants.
+STICK_DIRECTIONS = {
+    'up': StickEvent.UP,
+    'down': StickEvent.DOWN,
+    'left': StickEvent.LEFT,
+    'right': StickEvent.RIGHT,
+    'middle': StickEvent.MIDDLE,
+}
+STICK_ACTIONS = {
+    'pressed': StickEvent.PRESSED,
+    'released': StickEvent.RELEASED,
+    'held': StickEvent.HELD,
+}
+# sensor_msgs/Joy button order: up, down, left, right, middle.
+JOY_BUTTON_INDEX = {'up': 0, 'down': 1, 'left': 2, 'right': 3, 'middle': 4}
+JOY_BUTTON_COUNT = len(JOY_BUTTON_INDEX)
 
 
 class SenseHatNode(Node):
@@ -30,6 +49,10 @@ class SenseHatNode(Node):
         self.declare_parameter('rotation', 0)
         self.declare_parameter('led_queue_size', 8)
         self.declare_parameter('legacy_string_topic', True)
+        self.declare_parameter('publish_stick_events', True)
+        self.declare_parameter('publish_held_events', False)
+        self.declare_parameter('publish_joy', True)
+        self.declare_parameter('stick_poll_frequency', 50.0)
 
         self._default_text_color = self._read_color_parameter('default_text_color')
         self._default_background_color = self._read_color_parameter('default_background_color')
@@ -44,6 +67,17 @@ class SenseHatNode(Node):
             self.get_logger().warning(
                 f'rotation parameter must be one of {VALID_ROTATIONS}, got {rotation}; using 0')
             rotation = 0
+
+        self._publish_stick_events = bool(
+            self.get_parameter('publish_stick_events').value)
+        self._publish_held_events = bool(
+            self.get_parameter('publish_held_events').value)
+        self._publish_joy = bool(self.get_parameter('publish_joy').value)
+        stick_frequency = float(self.get_parameter('stick_poll_frequency').value)
+        if stick_frequency <= 0.0:
+            self.get_logger().warning(
+                f'stick_poll_frequency must be > 0.0, got {stick_frequency}; using 50.0')
+            stick_frequency = 50.0
 
         # Publishers for sensors (example topics)
         self.temp_pub = self.create_publisher(Temperature, 'sensehat/temperature', 10)
@@ -62,6 +96,16 @@ class SenseHatNode(Node):
         self.sense.set_rotation(rotation)
         self.sense.clear()
 
+        # Stick (joystick) publishers. The joy level state is maintained from
+        # the same events, so /sensehat/joy works even with `held` filtered out.
+        self._joy_buttons = [0] * JOY_BUTTON_COUNT
+        self.stick_pub = None
+        self.joy_pub = None
+        if self._publish_stick_events:
+            self.stick_pub = self.create_publisher(StickEvent, STICK_TOPIC, 10)
+        if self._publish_joy:
+            self.joy_pub = self.create_publisher(Joy, JOY_TOPIC, 10)
+
         # Subscribers ------------------------------------------------------
         self.led_sub = self.create_subscription(
             LedCommand, LED_TOPIC, self.led_callback, 10)
@@ -75,12 +119,25 @@ class SenseHatNode(Node):
         timer_period = 1.0 / freq if freq > 0 else 0.1
         self.timer = self.create_timer(timer_period, self.publish_sensor_data)
 
+        # The stick is polled rather than driven by the library's callback
+        # thread: get_events() drains the kernel queue without blocking, and
+        # both paths would compete for the same evdev file descriptor.
+        self.stick_timer = None
+        if self._publish_stick_events or self._publish_joy:
+            self.stick_timer = self.create_timer(
+                1.0 / stick_frequency, self._poll_stick)
+
         self._led_thread = threading.Thread(
             target=self._led_worker, name='sensehat_led', daemon=True)
         self._led_thread.start()
 
+        summary = [f'LED commands on {LED_TOPIC}']
+        if self._publish_stick_events:
+            summary.append(f'stick events on {STICK_TOPIC}')
+        if self._publish_joy:
+            summary.append(f'joy state on {JOY_TOPIC}')
         self.get_logger().info(
-            f'SenseHatNode initialized (LED commands on {LED_TOPIC})')
+            f"SenseHatNode initialized ({', '.join(summary)})")
 
     # ------------------------------------------------------------------
     # Parameters
@@ -131,7 +188,68 @@ class SenseHatNode(Node):
         mag_msg.magnetic_field.z = mag['z']
         self.mag_pub.publish(mag_msg)
 
+        # Republish the joystick level state so subscribers that join after an
+        # event still learn which buttons are down.
+        if self._publish_joy:
+            self._publish_joy_state()
+
         self.get_logger().debug('Published real sensor data')
+
+    # ------------------------------------------------------------------
+    # Stick (joystick)
+    # ------------------------------------------------------------------
+    def _poll_stick(self):
+        try:
+            events = self.sense.stick.get_events()
+        except Exception as exc:  # noqa: B902 - never kill the timer
+            self.get_logger().error(
+                f'Failed to read stick events: {exc}', throttle_duration_sec=5.0)
+            return
+
+        for event in events:
+            direction = STICK_DIRECTIONS.get(event.direction)
+            action = STICK_ACTIONS.get(event.action)
+            if direction is None or action is None:
+                self.get_logger().debug(
+                    f'Ignoring unknown stick event '
+                    f'{event.direction!r}/{event.action!r}')
+                continue
+
+            if self._publish_joy and self._set_joy_button(
+                    event.direction, action != StickEvent.RELEASED):
+                self._publish_joy_state()
+
+            if action == StickEvent.HELD and not self._publish_held_events:
+                continue
+            if self.stick_pub is not None:
+                self._publish_stick_event(direction, action)
+                self.get_logger().debug(
+                    f'Stick event {event.direction} {event.action} published')
+
+    def _publish_stick_event(self, direction, action):
+        msg = StickEvent()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.direction = direction
+        msg.action = action
+        self.stick_pub.publish(msg)
+
+    def _set_joy_button(self, direction, pressed):
+        """Update the level state; return True when it actually changed."""
+        index = JOY_BUTTON_INDEX.get(direction)
+        if index is None:
+            return False
+        value = 1 if pressed else 0
+        if self._joy_buttons[index] == value:
+            return False
+        self._joy_buttons[index] = value
+        return True
+
+    def _publish_joy_state(self):
+        msg = Joy()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'sensehat'
+        msg.buttons = list(self._joy_buttons)
+        self.joy_pub.publish(msg)
 
     # ------------------------------------------------------------------
     # LED commands
